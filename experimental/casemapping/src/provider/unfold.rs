@@ -5,7 +5,7 @@
 //! Data for reverse folding
 
 #[cfg(feature = "datagen")]
-use crate::error::Error;
+use alloc::string::String;
 use icu_provider::prelude::*;
 use zerovec::ZeroMap;
 
@@ -46,13 +46,14 @@ impl<'data> CaseMappingUnfoldData<'data> {
     // Rust strings are UTF8 by default. To avoid the cost of converting from UTF16 on access,
     // we convert the ICU data into a more convenient format during construction.
     #[cfg(feature = "datagen")]
-    pub(crate) fn try_from_icu(raw: &[u16]) -> Result<Self, Error> {
+    #[allow(clippy::indexing_slicing)] // panics are ok in datagen
+    pub(crate) fn try_from_icu(raw: &[u16]) -> Result<Self, DataError> {
         const ROWS_INDEX: usize = 0;
         const ROW_WIDTH_INDEX: usize = 1;
         const STRING_WIDTH_INDEX: usize = 2;
 
         if raw.len() <= STRING_WIDTH_INDEX {
-            return Error::invalid("Unfold: header missing");
+            return Err(DataError::custom("Unfold: header missing"));
         }
 
         let num_rows = raw[ROWS_INDEX] as usize;
@@ -60,7 +61,7 @@ impl<'data> CaseMappingUnfoldData<'data> {
         let string_width = raw[STRING_WIDTH_INDEX] as usize;
 
         if row_width == 0 {
-            return Error::invalid("Unfold: invalid row width");
+            return Err(DataError::custom("Unfold: invalid row width"));
         }
 
         // Header takes up one row.
@@ -71,11 +72,11 @@ impl<'data> CaseMappingUnfoldData<'data> {
         debug_assert!(num_rows == row_data.chunks_exact(row_width).count());
         for row in row_data.chunks_exact(row_width) {
             let key = Self::decode_string(&row[..string_width])
-                .ok_or(Error::Validation("Unfold: unpaired surrogate in key"))?;
+                .ok_or(DataError::custom("Unfold: unpaired surrogate in key"))?;
             let val = Self::decode_string(&row[string_width..])
-                .ok_or(Error::Validation("Unfold: unpaired surrogate in value"))?;
+                .ok_or(DataError::custom("Unfold: unpaired surrogate in value"))?;
             if map.try_append(key.as_ref(), val.as_ref()).is_some() {
-                return Error::invalid("Unfold: keys not sorted/unique");
+                return Err(DataError::custom("Unfold: keys not sorted/unique"));
             }
         }
         Ok(Self { map })

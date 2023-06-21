@@ -9,8 +9,10 @@
 use crate::provider::data::{DotType, MappingKind};
 use crate::provider::exception_helpers::ExceptionSlot;
 use crate::provider::CaseMappingV1;
-use icu_collections::codepointinvlist::CodePointInversionListBuilder;
+use crate::set::ClosureSet;
+use core::fmt;
 use icu_locid::Locale;
+use writeable::Writeable;
 
 // Used to control the behavior of CaseMapping::fold.
 // Currently only used to decide whether to use Turkic (T) mappings for dotted/dotless i.
@@ -33,7 +35,8 @@ impl<'data> CaseMappingV1<'data> {
         if !data.has_exception() {
             if data.is_relevant_to(kind) {
                 let folded = c as i32 + data.delta() as i32;
-                char::from_u32(folded as u32).expect("Checked in validate()")
+                // GIGO: delta should be valid
+                char::from_u32(folded as u32).unwrap_or(c)
             } else {
                 c
             }
@@ -74,7 +77,8 @@ impl<'data> CaseMappingV1<'data> {
         if !data.has_exception() {
             if data.is_upper_or_title() {
                 let folded = c as i32 + data.delta() as i32;
-                char::from_u32(folded as u32).expect("Checked in validate()")
+                // GIGO: delta should be valid
+                char::from_u32(folded as u32).unwrap_or(c)
             } else {
                 c
             }
@@ -133,7 +137,8 @@ impl<'data> CaseMappingV1<'data> {
         if !data.has_exception() {
             if data.is_relevant_to(kind) {
                 let mapped = c as i32 + data.delta() as i32;
-                let mapped = char::from_u32(mapped as u32).expect("Checked in validate()");
+                // GIGO: delta should be valid
+                let mapped = char::from_u32(mapped as u32).unwrap_or(c);
                 FullMappingResult::CodePoint(mapped)
             } else {
                 FullMappingResult::CodePoint(c)
@@ -176,49 +181,6 @@ impl<'data> CaseMappingV1<'data> {
                 FullMappingResult::CodePoint(c)
             }
         }
-    }
-
-    pub(crate) fn to_full_lower(
-        &self,
-        c: char,
-        context: ContextIterator,
-        locale: CaseMapLocale,
-    ) -> FullMappingResult {
-        self.full_helper(c, context, locale, MappingKind::Lower)
-    }
-
-    pub(crate) fn to_full_upper(
-        &self,
-        c: char,
-        context: ContextIterator,
-        locale: CaseMapLocale,
-    ) -> FullMappingResult {
-        self.full_helper(c, context, locale, MappingKind::Upper)
-    }
-
-    // Titlecase mapping is not yet exposed
-    #[allow(dead_code)]
-    pub(crate) fn to_full_title(
-        &self,
-        c: char,
-        context: ContextIterator,
-        locale: CaseMapLocale,
-    ) -> FullMappingResult {
-        self.full_helper(c, context, locale, MappingKind::Title)
-    }
-
-    // Note: in ICU4C, case folding takes an options bag instead of a locale,
-    // with the only defined option being whether or not to use Turkic (T)
-    // mappings for dotted/dotless i. In ICU4X, we expose a similar locale-free
-    // API for case folding, but internally represent this as a Turkish locale
-    // to simplify shared code.
-    pub(crate) fn to_full_folding(
-        &self,
-        c: char,
-        context: ContextIterator,
-        locale: CaseMapLocale,
-    ) -> FullMappingResult {
-        self.full_helper(c, context, locale, MappingKind::Fold)
     }
 
     // These constants are used for hardcoded locale-specific foldings.
@@ -319,7 +281,7 @@ impl<'data> CaseMappingV1<'data> {
         c: char,
         context: ContextIterator,
         locale: CaseMapLocale,
-        _is_title: bool,
+        is_title: bool,
     ) -> Option<FullMappingResult> {
         if locale == CaseMapLocale::Turkish && c == 'i' {
             // In Turkic languages, i turns into a dotted capital I.
@@ -333,16 +295,15 @@ impl<'data> CaseMappingV1<'data> {
             // Remove dot_above after i with upper or titlecase.
             return Some(FullMappingResult::Remove);
         }
-        // TODO: ICU4C has a non-standard extension for Armenian ligature ech-yiwn.
-        // Should we also implement it?
-        // if c == '\u{587}' {
-        //     return match (locale, is_title) {
-        // 	(CaseMapLocale::Armenian, false) => Some(FullMappingResult::String("ԵՎ")),
-        // 	(CaseMapLocale::Armenian, true) => Some(FullMappingResult::String("Եվ")),
-        // 	(_, false) => Some(FullMappingResult::String("ԵՒ")),
-        // 	(_, true) => Some(FullMappingResult::String("Եւ")),
-        //     }
-        // }
+        // ICU4C's non-standard extension for Armenian ligature ech-yiwn.
+        if c == '\u{587}' {
+            return match (locale, is_title) {
+                (CaseMapLocale::Armenian, false) => Some(FullMappingResult::String("ԵՎ")),
+                (CaseMapLocale::Armenian, true) => Some(FullMappingResult::String("Եվ")),
+                (_, false) => Some(FullMappingResult::String("ԵՒ")),
+                (_, true) => Some(FullMappingResult::String("Եւ")),
+            };
+        }
         None
     }
 
@@ -364,120 +325,75 @@ impl<'data> CaseMappingV1<'data> {
             (_, _) => None,
         }
     }
+    pub(crate) fn full_helper_writeable<'a: 'data>(
+        &'a self,
+        src: &'a str,
+        locale: CaseMapLocale,
+        mapping: MappingKind,
+    ) -> impl Writeable + 'a {
+        struct FullCaseWriteable<'a> {
+            data: &'a CaseMappingV1<'a>,
+            src: &'a str,
+            locale: CaseMapLocale,
+            mapping: MappingKind,
+        }
 
-    pub(crate) fn full_lowercase(&self, src: &str, locale: CaseMapLocale) -> String {
-        let mut result = String::with_capacity(src.len());
+        impl<'a> Writeable for FullCaseWriteable<'a> {
+            #[allow(clippy::indexing_slicing)] // last_uncopied_index and i are known to be in bounds
+            fn write_to<W: fmt::Write + ?Sized>(&self, sink: &mut W) -> fmt::Result {
+                // To speed up the copying of long runs where nothing changes, we keep track
+                // of the start of the uncopied chunk, and don't copy it until we have to.
+                let mut last_uncopied_idx = 0;
 
-        // To speed up the copying of long runs where nothing changes, we keep track
-        // of the start of the uncopied chunk, and don't copy it until we have to.
-        let mut last_uncopied_idx = 0;
-
-        for (i, c) in src.char_indices() {
-            let context = ContextIterator::new(src, i);
-            match self.to_full_lower(c, context, locale) {
-                FullMappingResult::CodePoint(c2) => {
-                    if c == c2 {
-                        continue;
+                let src = self.src;
+                for (i, c) in src.char_indices() {
+                    let context = ContextIterator::new(&src[..i], &src[i..]);
+                    match self.data.full_helper(c, context, self.locale, self.mapping) {
+                        FullMappingResult::CodePoint(c2) => {
+                            if c == c2 {
+                                continue;
+                            }
+                            sink.write_str(&src[last_uncopied_idx..i])?;
+                            sink.write_char(c2)?;
+                            last_uncopied_idx = i + c.len_utf8();
+                        }
+                        FullMappingResult::Remove => {
+                            sink.write_str(&src[last_uncopied_idx..i])?;
+                            last_uncopied_idx = i + c.len_utf8();
+                        }
+                        FullMappingResult::String(s) => {
+                            sink.write_str(&src[last_uncopied_idx..i])?;
+                            sink.write_str(s)?;
+                            last_uncopied_idx = i + c.len_utf8();
+                        }
                     }
-                    result.push_str(&src[last_uncopied_idx..i]);
-                    result.push(c2);
-                    last_uncopied_idx = i + c.len_utf8();
                 }
-                FullMappingResult::Remove => {
-                    result.push_str(&src[last_uncopied_idx..i]);
-                    last_uncopied_idx = i + c.len_utf8();
+                if last_uncopied_idx < src.len() {
+                    sink.write_str(&src[last_uncopied_idx..])?;
                 }
-                FullMappingResult::String(s) => {
-                    result.push_str(&src[last_uncopied_idx..i]);
-                    result.push_str(s);
-                    last_uncopied_idx = i + c.len_utf8();
-                }
+                Ok(())
+            }
+            fn writeable_length_hint(&self) -> writeable::LengthHint {
+                writeable::LengthHint::at_least(self.src.len())
             }
         }
-        if last_uncopied_idx < src.len() {
-            result.push_str(&src[last_uncopied_idx..]);
+
+        FullCaseWriteable {
+            data: self,
+            src,
+            locale,
+            mapping,
         }
-        result
     }
 
-    pub(crate) fn full_uppercase(&self, src: &str, locale: CaseMapLocale) -> String {
-        let mut result = String::with_capacity(src.len());
-
-        // To speed up the copying of long runs where nothing changes, we keep track
-        // of the start of the uncopied chunk, and don't copy it until we have to.
-        let mut last_uncopied_idx = 0;
-
-        for (i, c) in src.char_indices() {
-            let context = ContextIterator::new(src, i);
-            match self.to_full_upper(c, context, locale) {
-                FullMappingResult::CodePoint(c2) => {
-                    if c == c2 {
-                        continue;
-                    }
-                    result.push_str(&src[last_uncopied_idx..i]);
-                    result.push(c2);
-                    last_uncopied_idx = i + c.len_utf8();
-                }
-                FullMappingResult::Remove => {
-                    result.push_str(&src[last_uncopied_idx..i]);
-                    last_uncopied_idx = i + c.len_utf8();
-                }
-                FullMappingResult::String(s) => {
-                    result.push_str(&src[last_uncopied_idx..i]);
-                    result.push_str(s);
-                    last_uncopied_idx = i + c.len_utf8();
-                }
-            }
-        }
-        if last_uncopied_idx < src.len() {
-            result.push_str(&src[last_uncopied_idx..]);
-        }
-        result
-    }
-
-    pub(crate) fn full_folding(&self, src: &str, locale: CaseMapLocale) -> String {
-        let mut result = String::with_capacity(src.len());
-
-        // To speed up the copying of long runs where nothing changes, we keep track
-        // of the start of the uncopied chunk, and don't copy it until we have to.
-        let mut last_uncopied_idx = 0;
-
-        for (i, c) in src.char_indices() {
-            let context = ContextIterator::new(src, i);
-            match self.to_full_folding(c, context, locale) {
-                FullMappingResult::CodePoint(c2) => {
-                    if c == c2 {
-                        continue;
-                    }
-                    result.push_str(&src[last_uncopied_idx..i]);
-                    result.push(c2);
-                    last_uncopied_idx = i + c.len_utf8();
-                }
-                FullMappingResult::Remove => {
-                    result.push_str(&src[last_uncopied_idx..i]);
-                    last_uncopied_idx = i + c.len_utf8();
-                }
-                FullMappingResult::String(s) => {
-                    result.push_str(&src[last_uncopied_idx..i]);
-                    result.push_str(s);
-                    last_uncopied_idx = i + c.len_utf8();
-                }
-            }
-        }
-        if last_uncopied_idx < src.len() {
-            result.push_str(&src[last_uncopied_idx..]);
-        }
-        result
-    }
-
-    // Adds all simple case mappings and the full case folding for `c` to `set`.
-    // Also adds special case closure mappings.
-    // The character itself is not added.
-    // For example, the mappings
-    // - for s include long s
-    // - for sharp s include ss
-    // - for k include the Kelvin sign
-    fn add_case_closure<S: ClosureSet>(&self, c: char, set: &mut S) {
+    /// Adds all simple case mappings and the full case folding for `c` to `set`.
+    /// Also adds special case closure mappings.
+    /// The character itself is not added.
+    /// For example, the mappings
+    /// - for s include long s
+    /// - for sharp s include ss
+    /// - for k include the Kelvin sign
+    pub(crate) fn add_case_closure<S: ClosureSet>(&self, c: char, set: &mut S) {
         // Hardcode the case closure of i and its relatives and ignore the
         // data file data for these characters.
         // The Turkic dotless i and dotted I with their case mapping conditions
@@ -515,7 +431,8 @@ impl<'data> CaseMappingV1<'data> {
                 if delta != 0 {
                     // Add the one simple case mapping, no matter what type it is.
                     let codepoint = c as i32 + delta;
-                    let mapped = char::from_u32(codepoint as u32).expect("Checked in validate()");
+                    // GIGO: delta should be valid
+                    let mapped = char::from_u32(codepoint as u32).unwrap_or(c);
                     set.add_char(mapped);
                 }
             }
@@ -544,17 +461,11 @@ impl<'data> CaseMappingV1<'data> {
         exception.add_full_and_closure_mappings(set);
     }
 
-    // Maps the string to single code points and adds the associated case closure
-    // mappings.
-    // The string is mapped to code points if it is their full case folding string.
-    // In other words, this performs a reverse full case folding and then
-    // adds the case closure items of the resulting code points.
-    // If the string is found and its closure applied, then
-    // the string itself is added as well as part of its code points' closure.
-    //
-    // Returns true if the string was found
-    #[allow(dead_code)]
-    fn add_string_case_closure<S: ClosureSet>(&self, s: &str, set: &mut S) -> bool {
+    /// Maps the string to single code points and adds the associated case closure
+    /// mappings.
+    ///
+    /// (see docs on CaseMapping::add_string_case_closure)
+    pub(crate) fn add_string_case_closure<S: ClosureSet>(&self, s: &str, set: &mut S) -> bool {
         if s.chars().count() <= 1 {
             // The string is too short to find any match.
             return false;
@@ -575,8 +486,7 @@ impl<'data> CaseMappingV1<'data> {
 // An internal representation of locale. Non-Root values of this
 // enumeration imply that hard-coded special cases exist for this
 // language.
-#[derive(Copy, Clone, Eq, PartialEq)]
-#[allow(dead_code)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum CaseMapLocale {
     Root,
     Turkish,
@@ -586,14 +496,21 @@ pub enum CaseMapLocale {
     Armenian,
 }
 
-impl From<&Locale> for CaseMapLocale {
-    fn from(loc: &Locale) -> Self {
-        match loc.id.language.as_str() {
-            "tr" | "az" => Self::Turkish,
-            "lt" => Self::Lithuanian,
-            "el" => Self::Greek,
-            "nl" => Self::Dutch,
-            "hy" => Self::Armenian,
+impl CaseMapLocale {
+    pub const fn from_locale(loc: &Locale) -> Self {
+        use icu_locid::{subtags::Language, subtags_language as language};
+        const TR: Language = language!("tr");
+        const AZ: Language = language!("az");
+        const LT: Language = language!("lt");
+        const EL: Language = language!("el");
+        const NL: Language = language!("nl");
+        const HY: Language = language!("hy");
+        match loc.id.language {
+            TR | AZ => Self::Turkish,
+            LT => Self::Lithuanian,
+            EL => Self::Greek,
+            NL => Self::Dutch,
+            HY => Self::Armenian,
             _ => Self::Root,
         }
     }
@@ -616,25 +533,6 @@ impl<'a> FullMappingResult<'a> {
     }
 }
 
-// Interface for adding items to a closure set.
-pub trait ClosureSet {
-    /// Add a character to the set
-    fn add_char(&mut self, c: char);
-    /// Add a string to the set
-    fn add_string(&mut self, string: &str);
-}
-
-impl ClosureSet for CodePointInversionListBuilder {
-    fn add_char(&mut self, c: char) {
-        self.add_char(c)
-    }
-
-    // The current version of CodePointInversionList doesn't include strings.
-    // Trying to add a string is a no-op that will be optimized away.
-    #[inline]
-    fn add_string(&mut self, _string: &str) {}
-}
-
 pub(crate) struct ContextIterator<'a> {
     before: &'a str,
     after: &'a str,
@@ -642,10 +540,10 @@ pub(crate) struct ContextIterator<'a> {
 
 impl<'a> ContextIterator<'a> {
     // Returns a context iterator with the characters before
-    // and after the character at a given index.
-    pub fn new(s: &'a str, idx: usize) -> Self {
-        let before = &s[..idx];
-        let mut char_and_after = s[idx..].chars();
+    // and after the character at a given index, given the preceding
+    // string and the succeding string including the character itself
+    pub fn new(before: &'a str, char_and_after: &'a str) -> Self {
+        let mut char_and_after = char_and_after.chars();
         char_and_after.next(); // skip the character itself
         let after = char_and_after.as_str();
         Self { before, after }
